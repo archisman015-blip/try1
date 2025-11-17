@@ -1,59 +1,39 @@
+import os
+import re
+import time
+import io
+import zipfile
+import tempfile
+from typing import List
+
 import streamlit as st
 import pdfplumber
-from gtts import gTTS
-import tempfile
-import os
+from gtts import gTTS, gTTSError
 
-st.title("📰 PDF to Audio Converter")
+# ---------------- Helpers ----------------
 
-st.write("Upload a newspaper PDF (with selectable text). Scanned/image-only pages are ignored.")
+def clean_extracted(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)        # join hyphenated words
+    text = re.sub(r"\n(?=[^\n])", " ", text)            # single newlines -> space
+    text = re.sub(r"\s+", " ", text)                    # collapse whitespace
+    return text.strip()
 
-uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
-
-if uploaded_pdf:
-    st.success("PDF uploaded successfully!")
-
-    if st.button("Convert to MP3"):
-        text_content = ""
-
-        # Extract text from PDF
-        with pdfplumber.open(uploaded_pdf) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text_content += extracted + "\n\n"
-
-        if not text_content.strip():
-            st.error("No selectable text found in this PDF. (Scanned PDFs will not work.)")
-        else:
-            st.subheader("Extracted Text (preview)")
-            st.text_area("Preview", text_content[:3000], height=300)
-
-            # Convert text to MP3 using gTTS
-           # ---- Robust chunked gTTS generation (reliable on cloud) ----
-import time
-from gtts import gTTSError
-
-def generate_gtts_parts(text: str, tmp_dir: str, max_chars_per_call: int = 2000, retries: int = 3, pause: float = 1.0):
-    """
-    Chunk text and create MP3 parts using gTTS. Returns list of file paths.
-    - max_chars_per_call: conservative chunk size
-    - retries: attempts per chunk
-    """
+def chunk_text_for_tts(text: str, max_chars: int = 2000) -> List[str]:
     if not text:
         return []
-
-    import re
     sentences = re.split(r'(?<=[.!?])\s+', text)
     parts = []
     cur = ""
     for s in sentences:
-        if len(cur) + len(s) + 1 > max_chars_per_call:
+        if len(cur) + len(s) + 1 > max_chars:
             if cur:
                 parts.append(cur.strip())
-            if len(s) > max_chars_per_call:
-                for i in range(0, len(s), max_chars_per_call):
-                    parts.append(s[i:i+max_chars_per_call].strip())
+            if len(s) > max_chars:
+                # hard-split long sentence
+                for i in range(0, len(s), max_chars):
+                    parts.append(s[i:i+max_chars].strip())
                 cur = ""
             else:
                 cur = s
@@ -61,8 +41,14 @@ def generate_gtts_parts(text: str, tmp_dir: str, max_chars_per_call: int = 2000,
             cur = (cur + " " + s).strip()
     if cur:
         parts.append(cur)
+    return parts
 
-    out_paths = []
+def generate_gtts_parts(text: str, tmp_dir: str, max_chars_per_call: int = 2000, retries: int = 3, pause: float = 1.0) -> List[str]:
+    """Chunk text and generate MP3 parts using gTTS. Returns list of file paths."""
+    if not text:
+        return []
+    parts = chunk_text_for_tts(text, max_chars=max_chars_per_call)
+    out_paths: List[str] = []
     for idx, chunk in enumerate(parts, start=1):
         out_path = os.path.join(tmp_dir, f"part_{idx:03d}.mp3")
         success = False
@@ -84,45 +70,77 @@ def generate_gtts_parts(text: str, tmp_dir: str, max_chars_per_call: int = 2000,
         out_paths.append(out_path)
     return out_paths
 
-with st.spinner("Converting to audio (chunked)..."):
-    tmp_dir = tempfile.mkdtemp(prefix="tts_parts_")
+# ---------------- Streamlit UI ----------------
+
+st.set_page_config(page_title="PDF → Audio Converter", layout="centered")
+st.title("📰 PDF → Audio Converter")
+st.write("Upload a newspaper PDF (selectable text). Scanned/image-only pages are ignored — use OCR before upload for scanned PDFs.")
+
+uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
+if not uploaded_pdf:
+    st.info("Upload a PDF file to begin.")
+    st.stop()
+
+if st.button("Convert to MP3"):
+    # extract text
+    text_content = ""
     try:
-        part_paths = generate_gtts_parts(text_content, tmp_dir)
+        with pdfplumber.open(uploaded_pdf) as pdf:
+            for page in pdf.pages:
+                ptext = page.extract_text() or ""
+                if ptext.strip():
+                    text_content += ptext + "\n\n"
     except Exception as e:
-        st.error(f"Audio generation failed: {e}")
-        print("gTTS error detail:", e)
+        st.error(f"Failed to read PDF: {e}")
         st.stop()
 
-# Present results
-if len(part_paths) == 1:
-    with open(part_paths[0], "rb") as f:
-        data = f.read()
-    st.audio(data, format="audio/mp3")
-    st.download_button("Download MP3", data=data, file_name=os.path.basename(part_paths[0]), mime="audio/mp3")
-else:
-    zip_name = os.path.join(tmp_dir, "audio_parts.zip")
-    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in part_paths:
-            zf.write(p, arcname=os.path.basename(p))
-    with open(zip_name, "rb") as f:
-        zdata = f.read()
-    st.download_button("Download all MP3 parts (.zip)", data=zdata, file_name="audio_parts.zip", mime="application/zip")
+    text_content = clean_extracted(text_content)
+    if not text_content:
+        st.error("No selectable text found in the PDF. Scanned/image-only PDFs are ignored.")
+        st.stop()
 
-st.success("Done — audio ready.")
+    st.subheader("Preview (first 3000 chars)")
+    st.text_area("Preview", value=text_content[:3000], height=300)
 
+    # choose chunk size (tune down if gTTS fails)
+    max_chars = st.slider("Max chars per gTTS call", min_value=1200, max_value=4000, value=2000, step=100)
 
-            # Load audio to display in Streamlit
-            audio_bytes = open(tmp_file.name, "rb").read()
+    with st.spinner("Converting to audio (chunked, this may take some time)..."):
+        tmp_dir = tempfile.mkdtemp(prefix="tts_parts_")
+        try:
+            part_paths = generate_gtts_parts(text_content, tmp_dir, max_chars_per_call=max_chars, retries=3, pause=1.0)
+        except Exception as e:
+            st.error(f"Audio generation failed: {e}")
+            # print to logs for debugging
+            print("gTTS error detail:", e)
+            # cleanup partial files
+            try:
+                for f in os.listdir(tmp_dir):
+                    os.remove(os.path.join(tmp_dir, f))
+            except Exception:
+                pass
+            st.stop()
 
-            st.audio(audio_bytes, format="audio/mp3")
+    if not part_paths:
+        st.error("No audio parts were created.")
+        st.stop()
 
-            st.download_button(
-                label="Download MP3",
-                data=audio_bytes,
-                file_name="output.mp3",
-                mime="audio/mp3"
-            )
+    # Present results: single MP3 if only one part; otherwise provide zip of parts
+    if len(part_paths) == 1:
+        with open(part_paths[0], "rb") as f:
+            data = f.read()
+        st.audio(data, format="audio/mp3")
+        st.download_button("Download MP3", data=data, file_name=os.path.basename(part_paths[0]), mime="audio/mp3")
+    else:
+        zip_path = os.path.join(tmp_dir, f"{os.path.splitext(uploaded_pdf.name)[0]}_mp3_parts.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in part_paths:
+                zf.write(p, arcname=os.path.basename(p))
+        with open(zip_path, "rb") as f:
+            zdata = f.read()
+        st.download_button("Download all MP3 parts (.zip)", data=zdata, file_name=os.path.basename(zip_path), mime="application/zip")
+        # Optionally show first part in audio player
+        with open(part_paths[0], "rb") as f:
+            st.audio(f.read(), format="audio/mp3")
 
-            # Cleanup temp file
-            os.remove(tmp_file.name)
-            st.success("Conversion completed!")
+    st.success("Conversion completed. Download above.")
