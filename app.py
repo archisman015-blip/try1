@@ -4,6 +4,7 @@ import time
 import io
 import zipfile
 import tempfile
+import random
 from typing import List
 
 import streamlit as st
@@ -20,7 +21,7 @@ def clean_extracted(text: str) -> str:
     text = re.sub(r"\s+", " ", text)                    # collapse whitespace
     return text.strip()
 
-def chunk_text_for_tts(text: str, max_chars: int = 2000) -> List[str]:
+def chunk_text_for_tts(text: str, max_chars: int = 1200) -> List[str]:
     if not text:
         return []
     sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -43,32 +44,57 @@ def chunk_text_for_tts(text: str, max_chars: int = 2000) -> List[str]:
         parts.append(cur)
     return parts
 
-def generate_gtts_parts(text: str, tmp_dir: str, max_chars_per_call: int = 2000, retries: int = 3, pause: float = 1.0) -> List[str]:
-    """Chunk text and generate MP3 parts using gTTS. Returns list of file paths."""
+# ---- Hardened chunked gTTS generator (backoff, jitter, throttling) ----
+def generate_gtts_parts(text: str,
+                        tmp_dir: str,
+                        max_chars_per_call: int = 1200,
+                        retries: int = 6,
+                        base_pause: float = 1.5,
+                        jitter: float = 1.0,
+                        per_chunk_delay: float = 0.8) -> List[str]:
+    """
+    Generate MP3 parts using gTTS with robust retry/backoff + jitter.
+    - max_chars_per_call: smaller chunk size reduces chance of rejection.
+    - retries: number of attempts per chunk.
+    - base_pause: base backoff seconds (exponential).
+    - jitter: max seconds of random jitter added to backoff.
+    - per_chunk_delay: pause after a successful chunk to avoid bursts.
+    """
     if not text:
         return []
     parts = chunk_text_for_tts(text, max_chars=max_chars_per_call)
     out_paths: List[str] = []
+
     for idx, chunk in enumerate(parts, start=1):
         out_path = os.path.join(tmp_dir, f"part_{idx:03d}.mp3")
-        success = False
         last_err = None
         for attempt in range(1, retries + 1):
             try:
                 t = gTTS(chunk, lang='en')
                 t.save(out_path)
-                success = True
+                # brief delay after success to avoid immediate bursts
+                time.sleep(per_chunk_delay)
+                out_paths.append(out_path)
+                last_err = None
                 break
             except gTTSError as e:
                 last_err = e
-                time.sleep(pause * attempt)
+                msg = str(e)
+                if '429' in msg or 'Too Many Requests' in msg:
+                    wait = base_pause * (2 ** attempt) + random.uniform(0, jitter * 2)
+                else:
+                    wait = base_pause * (2 ** (attempt - 1)) + random.uniform(0, jitter)
+                print(f"[gTTS backoff] chunk {idx} attempt {attempt} failed: {e}. Backing off {wait:.1f}s")
+                time.sleep(wait)
             except Exception as e:
                 last_err = e
-                time.sleep(pause * attempt)
-        if not success:
-            raise RuntimeError(f"gTTS failed for chunk {idx}: {last_err}")
-        out_paths.append(out_path)
+                wait = base_pause * (2 ** (attempt - 1)) + random.uniform(0, jitter)
+                print(f"[gTTS error] chunk {idx} attempt {attempt} failed (exc): {e}. Backing off {wait:.1f}s")
+                time.sleep(wait)
+        if last_err is not None:
+            raise RuntimeError(f"gTTS failed for chunk {idx} after {retries} attempts: {last_err}")
     return out_paths
+# -------------------------------------------------------
 
 # ---------------- Streamlit UI ----------------
 
@@ -103,15 +129,19 @@ if st.button("Convert to MP3"):
     st.text_area("Preview", value=text_content[:3000], height=300)
 
     # choose chunk size (tune down if gTTS fails)
-    max_chars = st.slider("Max chars per gTTS call", min_value=1200, max_value=4000, value=2000, step=100)
+    max_chars = st.slider("Max chars per gTTS call", min_value=600, max_value=4000, value=1200, step=100)
 
     with st.spinner("Converting to audio (chunked, this may take some time)..."):
         tmp_dir = tempfile.mkdtemp(prefix="tts_parts_")
         try:
-            part_paths = generate_gtts_parts(text_content, tmp_dir, max_chars_per_call=max_chars, retries=3, pause=1.0)
+            part_paths = generate_gtts_parts(text_content, tmp_dir,
+                                             max_chars_per_call=max_chars,
+                                             retries=6,
+                                             base_pause=1.5,
+                                             jitter=1.0,
+                                             per_chunk_delay=0.9)
         except Exception as e:
             st.error(f"Audio generation failed: {e}")
-            # print to logs for debugging
             print("gTTS error detail:", e)
             # cleanup partial files
             try:
